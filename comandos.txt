@@ -1,0 +1,13 @@
+
+
+
+
+python -m venv venv
+.\venv\Scripts\activate
+pip install requests
+pip install qrcode
+
+pip install Flask
+python sender.py
+
+pip install Pillow
