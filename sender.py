@@ -1,19 +1,23 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-import json
+import re
 import qrcode
 from io import BytesIO 
 from base64 import b64encode
+from uuid import uuid4
+from threading import Thread, Lock
 import jwt
-import datetime
+import time
+import random
+from datetime import datetime, timedelta, timezone
 app = Flask(__name__)
 # =================================================================
 # CONFIGURACIÓN
 # =================================================================
 
 # La URL de tu servidor Baileys (asegúrate de que esté corriendo)
-BAILEYS_API_URL = "http://localhost:3000/send-bulk"
+BAILEYS_API_URL = "http://localhost:3000/send"
 
 # El código de país que usarás.
 # EJEMPLO: Si todos tus números son de Perú, usarías '51'
@@ -24,27 +28,65 @@ JWT_SECRET_KEY = "xJvOFRengB9iMGoCtTH0yDV6wL45ZuWN"
 FIXED_USERNAME = "admin"
 FIXED_PASSWORD = "certifact123"
 TOKEN_EXPIRATION_MINUTES = 30
+JOBS = {} 
+JOBS_LOCK = Lock()
 
 from functools import wraps
 # =================================================================
 # FUNCIÓN DE ENVÍO
 # =================================================================
-def format_numbers(raw_numbers: list):
-    """Formatea los números para cumplir con el requisito de Baileys (código de país)."""
-    
-    formatted_numbers = []
-    for num in raw_numbers:
-        cleaned_num = "".join(filter(str.isdigit, num))
-        
-        # Lógica de prefijo (solo si el código de país está configurado)
-        if CODIGO_PAIS and not cleaned_num.startswith(CODIGO_PAIS):
-            formatted_num = CODIGO_PAIS + cleaned_num
-        else:
-            formatted_num = cleaned_num
-            
-        formatted_numbers.append(formatted_num)
-        
-    return formatted_numbers
+
+
+def send_worker(job_id, message, contacts):
+    errors_in_row = 0
+    time.sleep(random.randint(5, 15)) # Espera inicial
+    for idx, contact in enumerate(contacts):
+
+        with JOBS_LOCK:
+            if JOBS[job_id]["status"] != "running":
+                return
+
+        try:
+            final_message = message + random.choice(["", " ", " 👍", " 💡", " 💻"])
+            r = requests.post(
+                BAILEYS_API_URL,
+                json={"contacto": contact, "message": final_message},
+                timeout=10
+            )
+
+            if r.status_code == 200:
+                with JOBS_LOCK:
+                    JOBS[job_id]["sent"] += 1
+                errors_in_row = 0
+            else:
+                raise Exception(f"HTTP {r.status_code}")
+
+        except Exception:
+            with JOBS_LOCK:
+                JOBS[job_id]["errors"] += 1
+            errors_in_row += 1
+
+            if errors_in_row >= 3:
+                with JOBS_LOCK:
+                    JOBS[job_id]["status"] = "stopped"
+                    JOBS[job_id]["finished_at"] = datetime.utcnow().isoformat()
+                return
+
+        # Delay humano
+        time.sleep(random.randint(3, 8))
+
+        # Pausa larga cada 5 mensajes
+        if (idx + 1) % 5 == 0:
+            time.sleep(random.randint(30, 60))
+
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["finished_at"] = datetime.utcnow().isoformat()
+
+    time.sleep(300)  # 5 minutos
+    with JOBS_LOCK:
+        JOBS.pop(job_id, None)
+
 
 def token_required(f):
     """
@@ -172,10 +214,6 @@ def send_message_service():
                 "details": data
             }), 400
 
-        # Almacenar resultados del envío
-        results = []
-        successful_count = 0
-
         
         if not isinstance(contactos, list):
             return jsonify({
@@ -184,44 +222,34 @@ def send_message_service():
             }), 400
 
         # 2. Formateo y preparación del payload
-        formatted_contactos = format_contactos(contactos)
-        if not formatted_contactos:
-             return jsonify({
-                "status": "error",
-                "message": "Ningún contacto fue válido después de la limpieza y formateo (revisa que tengan 9 dígitos)."
-            }), 400
-        print(f"📢 Se enviará mensajes a {len(formatted_contactos)} contactos válidos.")
-        payload = {
-            "message": message,
-            "contacts": formatted_contactos,
-            "delay": 1000 # Retraso entre mensajes en milisegundos (ajusta si es necesario)
-        }
+        contacts = clean_and_validate_contacts(contactos)
+        if not contacts:
+            return jsonify({"error": "No hay contactos válidos"}), 400
+        
+        job_id = str(uuid4())
 
-        print(f"📢 Enviando {len(formatted_contactos)} mensajes al API de Baileys...")
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "total": len(contacts),
+                "sent": 0,
+                "errors": 0,
+                "status": "running",
+                "started_at": datetime.utcnow().isoformat(),
+                "finished_at": None
+            }
+        Thread(
+            target=send_worker,
+            args=(job_id, message, contacts),
+            daemon=True
+        ).start()
+        print(f"📢 Enviando {len(contacts)} mensajes al API de Baileys...")
 
         # 3. Envío al servidor Baileys
-        response = requests.post(
-            BAILEYS_API_URL, 
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        # 4. Devolver la respuesta de Baileys
-        baileys_response = response.json()
-        
-        if response.status_code == 200:
-            return jsonify({
-                "status": "success",
-                "message": "Solicitud de envío masivo enviada al servidor Baileys.",
-                "details": baileys_response
-            }), 200
-        else:
-            # Si Baileys devuelve un error (ej. WhatsApp no conectado)
-            return jsonify({
-                "status": "error_baileys",
-                "message": "El servidor Baileys respondió con un error",
-                "details": baileys_response
-            }), response.status_code
+        return jsonify({
+            "status": "accepted",
+            "job_id": job_id,
+            "total": len(contacts)
+        }), 202
 
     except requests.exceptions.ConnectionError:
         return jsonify({
@@ -237,106 +265,71 @@ def send_message_service():
             "details": str(e)
         }), 500
 
-def format_contactos(contactos):
+def clean_and_validate_contacts(raw_contacts):
     """
-    Valida y formatea la lista de contactos recibida del frontend.
-    
-    Cada contacto es un objeto: { "numero": "...", "nombre": "..." }
-    
-    Reglas de validación:
-    1. El número debe tener exactamente 9 dígitos. (Asume formato local sin código de país).
-    2. Si el número no cumple, la fila se omite.
-    3. Si el nombre es vacío o None, se reemplaza por "Cliente".
+    Espera una lista de objetos:
+    [
+        { "nombre": "Juan", "numero": "987 654 321" },
+        { "nombre": "María", "numero": "+51 912-345-678" }
+    ]
+    """
 
-    Retorna una lista de contactos limpios y listos para ser enviados.
-    Ejemplo: [ {"numero": "51987654321", "nombre": "Juan Pérez"}, ... ]
-    """
-    formatted_list = []
-    
-    for contacto in contactos:
-        raw_numero = str(contacto.get('numero', '')).strip()
-        raw_nombre = str(contacto.get('nombre', '')).strip()
-        
-        # 1. Limpiar el número: quitar espacios, guiones y cualquier carácter no dígito
-        cleaned_numero = ''.join(filter(str.isdigit, raw_numero))
-        
-        # 2. Validación de longitud (asume 9 dígitos locales sin código de país)
-        if len(cleaned_numero) != 9:
-            # Omitir fila si no tiene 9 dígitos
-            print(f"⚠️ Número omitido: '{raw_numero}' no tiene 9 dígitos.")
+    valid = []
+    seen = set()
+
+    for contact in raw_contacts:
+        # Validar estructura básica
+        if not isinstance(contact, dict):
             continue
-            
-        # 3. Formateo final del número: añadir el código de país (Ej: 51 para Perú)
-        # NOTA IMPORTANTE: Baileys requiere el código de país. 
-        # Si todos tus contactos son de Perú, usa '51'. Ajusta este valor si es necesario.
-        numero_con_codigo_pais = f"51{cleaned_numero}"
 
-        # 4. Validar y reemplazar el nombre
-        final_nombre = raw_nombre if raw_nombre else "Cliente"
-        
-        # 5. Agregar el contacto limpio a la lista
-        formatted_list.append({
-            "numero": numero_con_codigo_pais,
-            "nombre": final_nombre
+        nombre = (contact.get("nombre") or "Cliente").strip()
+        numero_raw = contact.get("numero")
+
+        if not numero_raw:
+            continue
+
+        # Limpiar número: solo dígitos
+        num = re.sub(r"\D", "", str(numero_raw))
+
+        # Caso Perú:
+        # - 9 dígitos empezando en 9
+        # - o 11 dígitos empezando en 51
+        if len(num) == 9 and num.startswith("9"):
+            full = CODIGO_PAIS + num
+        elif len(num) == 11 and num.startswith(CODIGO_PAIS):
+            full = num
+        else:
+            continue  # número inválido
+
+        # Evitar duplicados
+        if full in seen:
+            continue
+
+        seen.add(full)
+
+        # Guardar contacto limpio
+        valid.append({
+            "nombre": nombre,
+            "numero": full
         })
-        
-    return formatted_list
 
-def send_bulk_message(message: str, raw_numbers: list):
-    """
-    Consume el endpoint /send-bulk del servidor Baileys.
-    Formatea los números agregando el código de país si no lo tienen.
-    """
-    
-    # 1. Formateo de números (Asegurarse que todos tengan el código de país)
-    # Baileys necesita el código de país al inicio (Ej. 51987654321)
-    formatted_numbers = []
-    for num in raw_numbers:
-        # Limpia el número dejando solo dígitos
-        cleaned_num = "".join(filter(str.isdigit, num))
-        
-        # Lógica simple: Si el número no empieza con el código de país, lo agrega
-        if not cleaned_num.startswith(CODIGO_PAIS) and len(CODIGO_PAIS) > 0:
-            formatted_num = CODIGO_PAIS + cleaned_num
-        else:
-            formatted_num = cleaned_num
-            
-        formatted_numbers.append(formatted_num)
+    return valid
 
-    # 2. Creación del payload (JSON) para la API
-    payload = {
-        "message": message,
-        "numbers": formatted_numbers,
-        # Opcional: Establece un retraso en milisegundos entre cada mensaje
-        "delay": 2000 
-    }
+@app.route('/status/<job_id>', methods=['GET'])
+@token_required
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
 
-    print("📢 Intentando enviar mensajes...")
-    print(f"Número de destinatarios: {len(formatted_numbers)}")
-    print(f"Mensaje a enviar: {message[:30]}...")
-    
-    # 3. Envío de la solicitud HTTP
-    try:
-        response = requests.post(
-            BAILEYS_API_URL, 
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        # 4. Manejo de la respuesta
-        if response.status_code == 200:
-            print("\n✅ Solicitud enviada exitosamente al servidor.")
-            print(json.dumps(response.json(), indent=4))
-        else:
-            print(f"\n❌ Error al comunicarse con el servidor (HTTP {response.status_code}):")
-            print(response.text)
-            
-    except requests.exceptions.ConnectionError:
-        print(f"\n❌ Error de conexión: Asegúrate de que el servidor Baileys esté corriendo en {BAILEYS_API_URL.split('/send-bulk')[0]}")
-    except Exception as e:
-        print(f"\n❌ Ocurrió un error inesperado: {e}")
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+
+    return jsonify(job), 200
+
+
 
 @app.post('/logout')
+@token_required
 def logout_session():
     """
     Reenvía la petición POST al servidor Baileys para cerrar la sesión.
@@ -372,6 +365,7 @@ def logout_session():
 # =================================================================
 
 @app.post('/reset-session')
+@token_required
 def reset_session():
     """
     Reenvía la petición POST al servidor Baileys para borrar la sesión y reiniciar.
@@ -416,12 +410,12 @@ def login_user():
     if username == FIXED_USERNAME and password == FIXED_PASSWORD:
         
         # 2. Generar el payload del token (incluye el tiempo de expiración)
-        expiration_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
+        expiration_time = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
         
         token_payload = {
             'username': username,
             'exp': expiration_time,
-            'iat': datetime.datetime.now(datetime.timezone.utc)
+            'iat': datetime.now(timezone.utc)
         }
         
         # 3. Firmar el token usando la clave secreta
@@ -462,4 +456,4 @@ if __name__ == "__main__":
     print("=========================================")
     CORS(app)
     # Usa debug=True solo para desarrollo.
-    app.run(port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000)
